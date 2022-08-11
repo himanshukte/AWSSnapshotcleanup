@@ -1,0 +1,168 @@
+const AWS = require('aws-sdk');
+let ec2 = new AWS.EC2();
+
+const MaxResults = 100;
+const TagKey = 'CSMExpired';
+const TagValue = 'true';
+
+exports.handler = async (event, context) => {
+  const response = {};
+  try{
+    const results = [];
+    // fetch region and account details from lambda function arn
+    const invokedFunctionARNDetails = context.invokedFunctionArn.split(':');
+    const invokedFunctionRegion = invokedFunctionARNDetails[3];
+    const invokedFunctionAccount = invokedFunctionARNDetails[4];
+  
+    // if regions not provided delete csm expired snapshot in default region
+    if(!event.regions){
+      event.regions = [];
+      event.regions.push(invokedFunctionRegion);
+      console.log(`regions not provided, deleting csm expired snapshot in region: ${invokedFunctionRegion}`);
+    } else { // if regions parameter provided check if regions is an array and has valid values 
+      if(!Array.isArray(event.regions)){ // regions parameter should be array
+        console.log('regions parameter is not array');
+        const err = new Error();
+        err.message = 'regions parameter should be array';
+        throw err;
+      } else if(event.regions.length === 0){ // if regions not provided use default region
+        event.regions = [];
+        event.regions.push(invokedFunctionRegion);
+        console.log(`regions not provided, deleting csm expired snapshot in region: ${invokedFunctionRegion}`);
+      } else{
+        for(const region of event.regions){
+        // check if given region exists
+          const exist = await regionExists(region);
+          if(!exist){
+            console.log(`Invalid region '${region}' provided`);
+            const err = new Error();
+            err.message = `Invalid region '${region}' provided`;
+            throw err;
+          }
+        }
+      }
+    }
+  
+    // for each region delete csm expired snapshot
+    for(const region of event.regions){
+      console.log(`deleting csm expired snapshots from region: ${region}, account: ${invokedFunctionAccount}`);
+      const result = await executeDelete(region, invokedFunctionAccount);
+      results.push(result);
+    }
+    
+    response.status_code = 200;
+    response.results = results;
+  }catch(err){
+    response.status_code = 500;
+    response.error = err;
+  }
+  return response;
+};
+
+async function executeDelete(givenRegion, invokedFunctionAccount){
+  const response = {};
+  response.region = givenRegion;
+  response.account_id= invokedFunctionAccount;
+  try{
+    AWS.config.update({region: givenRegion});
+    ec2 = new AWS.EC2();
+
+    response.identified_csm_expired_snapshot_list = [];
+    response.successful_deletes = [];
+    response.unsuccessful_deletes = {};
+    
+    let nextToken, hasMoreSnapshots = true;
+    while(hasMoreSnapshots){
+      // fetch snapshots in paginated manner
+      const csmExpiredSnapshotsList = await listSnapshots(invokedFunctionAccount, nextToken);
+      nextToken = csmExpiredSnapshotsList.NextToken; 
+      console.log(`fetched ${csmExpiredSnapshotsList.Snapshots.length} snapshots from region: ${response.region}, account: ${response.account_id}`);
+      console.log(`Following snapshots list is identified for deletion: ${JSON.stringify(csmExpiredSnapshotsList)}`);
+
+      // delete all the identified csm expired snapshot one by one
+      for(const snapshot of csmExpiredSnapshotsList.Snapshots){
+        response.identified_csm_expired_snapshot_list.push(snapshot.SnapshotId);
+        try{
+          console.log(`deleting snapshot: ${snapshot.SnapshotId}`);
+          await deleteSnapshot(snapshot.SnapshotId);
+          response.successful_deletes.push(snapshot.SnapshotId);
+        }catch(err){
+          console.log(`Error deleting snapshot ${snapshot.SnapshotId}, Error: ${JSON.stringify(err)}`);
+          response.unsuccessful_deletes[snapshot.SnapshotId] = err.message;
+        }
+      }
+            
+      if(!nextToken){
+        hasMoreSnapshots = false;
+      }
+    }
+
+    console.log(`Execution completed for region: ${givenRegion}, response: ${JSON.stringify(response)}`);
+  }catch(err){
+    console.log(`Error executing lambda script, Error: ${JSON.stringify(err)}`);
+    response.error = err;
+  }
+  return response;  
+}
+
+// listSnapshots fetches the snapshot from aws in paginated manner, it will return 'MaxResults' number of snapshots 
+function listSnapshots(accountId, nextToken){
+  return new Promise(function(resolve, reject){
+    const params = {
+      OwnerIds: [accountId],
+      MaxResults: MaxResults,
+      Filters: [
+        {
+          Name: `tag:${TagKey}`,
+          Values: [`${TagValue}`]
+        }
+      ]
+    };
+    if(nextToken){
+      params.NextToken = nextToken;
+    }
+    ec2.describeSnapshots(params, function(err, result){
+      if(err){
+        console.log(err);    
+        reject(err);
+      }
+      resolve(result);
+    });
+  });
+}
+
+// deleteSnapshot deletes the snapshot with particular snapshotId
+function deleteSnapshot(snapshotId){
+  return new Promise(function(resolve, reject){
+    const params = {
+      SnapshotId: snapshotId
+    };
+    ec2.deleteSnapshot(params, function(err, result){
+      if(err){
+        reject(err);
+      } 
+      resolve(result);
+    });
+  });
+}
+
+// listRegions fetches all the region from the aws account
+function listRegions(){
+  return new Promise(function(resolve, reject){
+    ec2.describeRegions({},function(err, result){
+      if(err){
+        reject(err);
+      }
+      resolve(result);
+    });
+  });
+}
+
+// regionExists check if the given region exists in aws
+async function regionExists(givenRegion){
+  const res = await listRegions();
+  const foundRegionList = res.Regions.filter(function(region){
+    return region.RegionName === givenRegion;
+  });
+  return (foundRegionList.length > 0);
+}
